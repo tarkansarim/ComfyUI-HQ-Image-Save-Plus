@@ -13,6 +13,25 @@
 ## Overview
 Save and load images and latents as 32bit EXRs
 
+### New (OCIO) Color Space Support
+- Load and save EXR with professional color spaces via OpenColorIO (OCIO)
+- Added tonemap options alongside existing ones (linear, sRGB, Reinhard):
+  - ACES: ACEScg, ACES2065-1, ACEScc, ACEScct
+  - Camera Log: ARRI LogC, RED Log3G10 / REDWideGamutRGB, Sony SLog3 / SGamut3, Log film scan (ADX10)
+  - Utility: scene-linear Rec.709-sRGB, Raw
+- Batch-safe processing for save/load with OCIO (handles (B,H,W,3) and (H,W,3))
+- No silent fallbacks: missing OCIO or unknown color space will raise a clear error
+
+### Requirements
+- Python package: `opencolorio` (added to requirements.txt)
+- OCIO config file: `ocio-v2_demo.ocio`
+  - Placed automatically in this node folder (or you can point to your own)
+
+### CLI Recommendations
+- Launch ComfyUI with higher precision for EXR workflows:
+  - `--fp32-vae`
+  - Optional: `--precision full`
+
 I recommend adding the `--fp32-vae` CLI argument for more accurate decoding. If you get an error saying that the OpenEXR codec is disabled, see [this issue.](https://github.com/spacepxl/ComfyUI-HQ-Image-Save/issues/8)
 
 Scatterplot of raw red/green values, left=PNG, right=EXR. PNG quantizes the image to 256 possible values per channel (2^8), while the EXR has full floating point precision.
@@ -29,3 +48,4 @@ b = (0.208 * r + 0.173 * g + 0.264 * b - 0.473 * a) * 0.18215
 ## Known Issues
 
 - No load TIFF node, and the TIFF save is bad/outdated
+- If you select an OCIO color space that is not present in your config, the node will raise an explicit error listing the failing step.

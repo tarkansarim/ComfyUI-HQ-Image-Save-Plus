@@ -10,6 +10,14 @@ import cv2 as cv
 import torch
 import numpy as np
 
+# Optional OpenColorIO (OCIO) import for advanced colorspaces
+try:
+    import PyOpenColorIO as OCIO  # type: ignore
+    _OCIO_AVAILABLE = True
+except Exception:
+    OCIO = None
+    _OCIO_AVAILABLE = False
+
 import folder_paths
 from comfy.cli_args import args
 from comfy.utils import PROGRESS_BAR_ENABLED, ProgressBar
@@ -25,6 +33,78 @@ def linearToSRGB(npArray):
     npArray[less] = npArray[less] * 12.92
     npArray[~less] = np.power(npArray[~less], 1/2.4) * 1.055 - 0.055
 
+def _get_ocio_config():
+    if not _OCIO_AVAILABLE:
+        raise Exception("OpenColorIO (opencolorio) is not installed. Install it via requirements.txt. No fallback will be applied.")
+    # Prefer a local config placed next to this file
+    here = os.path.dirname(__file__)
+    local_cfg = os.path.join(here, "ocio-v2_demo.ocio")
+    if os.path.exists(local_cfg):
+        return OCIO.Config.CreateFromFile(local_cfg)
+    # Fallback to common path provided by the user earlier
+    alt_cfg = r"E:\AI\OpenColorIO\docs\configurations\ocio-v2_demo.ocio"
+    if os.path.exists(alt_cfg):
+        return OCIO.Config.CreateFromFile(alt_cfg)
+    raise Exception("OCIO config 'ocio-v2_demo.ocio' not found. Place it alongside nodes.py or set a valid path.")
+
+_OCIO_TONEMAP_EXTRA = [
+    "ACEScg",
+    "ACES2065-1",
+    "ACEScc",
+    "ACEScct",
+    "ARRI LogC",
+    "RED Log3G10 / REDWideGamutRGB",
+    "Sony SLog3 / SGamut3",
+    "Log film scan (ADX10)",
+    "scene-linear Rec.709-sRGB",
+    "Raw",
+]
+
+def _get_tonemap_options():
+    base = ["linear", "sRGB", "Reinhard"]
+    if _OCIO_AVAILABLE:
+        # Only add extras if OCIO is available
+        return base + _OCIO_TONEMAP_EXTRA
+    return base
+
+def _ocio_convert_rgb(rgb_np, from_space, to_space):
+    """
+    Convert an image (H,W,3) float32 numpy array using OCIO between named color spaces.
+    No implicit clamping is applied here.
+    """
+    cfg = _get_ocio_config()
+    try:
+        proc = cfg.getProcessor(from_space, to_space).getDefaultCPUProcessor()
+    except Exception as e:
+        raise Exception(f"OCIO failed to create processor from '{from_space}' to '{to_space}': {e}")
+    # OCIO expects contiguous float32
+    arr = rgb_np.astype(np.float32, copy=False)
+    # Support (H,W,3) and (B,H,W,3)
+    try:
+        if arr.ndim == 3:
+            h, w, c = arr.shape
+            if c < 3:
+                raise Exception("Expected 3 channels for RGB conversion")
+            frame = np.ascontiguousarray(arr[..., :3])
+            img_desc = OCIO.PackedImageDesc(frame, w, h, 3)
+            proc.apply(img_desc)
+            arr[..., :3] = frame
+            return arr
+        elif arr.ndim == 4:
+            b, h, w, c = arr.shape
+            if c < 3:
+                raise Exception("Expected 3 channels for RGB conversion")
+            for i in range(b):
+                frame = np.ascontiguousarray(arr[i, ..., :3])
+                img_desc = OCIO.PackedImageDesc(frame, w, h, 3)
+                proc.apply(img_desc)
+                arr[i, ..., :3] = frame
+            return arr
+        else:
+            raise Exception(f"Unsupported tensor shape {arr.shape}, expected (H,W,3) or (B,H,W,3)")
+    except Exception as e:
+        raise Exception(f"OCIO CPUProcessor.apply (PackedImageDesc) failed: {e}")
+
 def load_EXR(filepath, tonemap):
     image = cv.imread(filepath, cv.IMREAD_UNCHANGED).astype(np.float32)
     if len(image.shape) == 2:
@@ -37,6 +117,22 @@ def load_EXR(filepath, tonemap):
     elif tonemap == "Reinhard":
         rgb = np.clip(rgb, 0, None)
         rgb = rgb / (rgb + 1)
+        linearToSRGB(rgb)
+        rgb = np.clip(rgb, 0, 1)
+    elif tonemap == "linear":
+        # Pass-through; Comfy will receive linear values (not clamped)
+        pass
+    else:
+        # Advanced OCIO path: assume EXR data is encoded in 'tonemap' space and convert to
+        # scene-linear Rec.709-sRGB primaries, then convert to sRGB display for Comfy UI IMAGE input.
+        if not _OCIO_AVAILABLE:
+            raise Exception("Requested advanced colorspace but OpenColorIO is not installed. Install 'opencolorio'.")
+        # Convert from source -> scene-linear Rec.709-sRGB
+        try:
+            rgb = _ocio_convert_rgb(rgb, tonemap, "scene-linear Rec.709-sRGB")
+        except Exception as e:
+            raise Exception(f"OCIO conversion failed when loading EXR from '{tonemap}' to 'scene-linear Rec.709-sRGB': {e}")
+        # Now convert scene-linear to sRGB display for UI
         linearToSRGB(rgb)
         rgb = np.clip(rgb, 0, 1)
     
@@ -71,7 +167,7 @@ class LoadEXR:
         return {
             "required": {
                 "filepath": ("STRING", {"default": "path to directory or .exr file"}),
-                "tonemap": (["linear", "sRGB", "Reinhard"], {"default": "sRGB"}),
+                "tonemap": (_get_tonemap_options(), {"default": "sRGB"}),
             },
             "optional": {
                 "image_load_cap": ("INT", {"default": 0, "min": 0, "step": 1}),
@@ -129,7 +225,7 @@ class LoadEXRFrames:
         return {
             "required": {
                 "filepath": ("STRING", {"default": "path/to/frame%04d.exr"}),
-                "tonemap": (["linear", "sRGB", "Reinhard"], {"default": "sRGB"}),
+                "tonemap": (_get_tonemap_options(), {"default": "sRGB"}),
                 "start_frame": ("INT", {"default": 1001, "min": 0, "max": 9999}),
                 "end_frame": ("INT", {"default": 1001, "min": 0, "max": 9999}),
             },
@@ -190,7 +286,7 @@ class SaveEXR:
             "required": {
                 "images": ("IMAGE",),
                 "filename_prefix": ("STRING", {"default": "ComfyUI"}),
-                "tonemap": (["linear", "sRGB", "Reinhard"], {"default": "sRGB"}),
+                "tonemap": (_get_tonemap_options(), {"default": "sRGB"}),
                 "version": ("INT", {"default": 1, "min": -1, "max": 999}),
                 "start_frame": ("INT", {"default": 1001, "min": 0, "max": 99999999}),
                 "frame_pad": ("INT", {"default": 4, "min": 1, "max": 8}),
@@ -221,6 +317,19 @@ class SaveEXR:
         if tonemap == "Reinhard":
             linear[...,:3] = np.clip(linear[...,:3], 0, 0.999999)
             linear[...,:3] = -linear[...,:3] / (linear[...,:3] - 1)
+        elif tonemap == "sRGB":
+            # Save EXR with sRGB code values (float). No-op here; already linearized above?
+            # Map back to sRGB for file if explicitly requested sRGB EXR.
+            linearToSRGB(linear[...,:3])
+            linear[...,:3] = np.clip(linear[...,:3], 0, 1)
+        elif tonemap != "linear":
+            # Advanced OCIO: convert from scene-linear Rec.709-sRGB to requested space
+            if not _OCIO_AVAILABLE:
+                raise Exception("Requested advanced colorspace but OpenColorIO is not installed. Install 'opencolorio'.")
+            try:
+                linear[...,:3] = _ocio_convert_rgb(linear[...,:3], "scene-linear Rec.709-sRGB", tonemap)
+            except Exception as e:
+                raise Exception(f"OCIO conversion failed when saving EXR to '{tonemap}' from 'scene-linear Rec.709-sRGB': {e}")
         
         bgr = linear.copy()
         bgr[:,:,:,0] = linear[:,:,:,2] # flip RGB to BGR for opencv
@@ -287,7 +396,7 @@ class SaveEXRFrames:
             "required": {
                 "images": ("IMAGE",),
                 "filepath": ("STRING", {"default": "path/to/frame%04d.exr"}),
-                "tonemap": (["linear", "sRGB", "Reinhard"], {"default": "sRGB"}),
+                "tonemap": (_get_tonemap_options(), {"default": "sRGB"}),
                 "start_frame": ("INT", {"default": 1001, "min": 0, "max": 9999}),
                 "overwrite": ("BOOLEAN", {"default": True}),
                 "save_workflow": (["ui", "api", "ui + api", "none"],),
@@ -322,6 +431,16 @@ class SaveEXRFrames:
         if tonemap == "Reinhard":
             linear[...,:3] = np.clip(linear[...,:3], 0, 0.999999)
             linear[...,:3] = -linear[...,:3] / (linear[...,:3] - 1)
+        elif tonemap == "sRGB":
+            linearToSRGB(linear[...,:3])
+            linear[...,:3] = np.clip(linear[...,:3], 0, 1)
+        elif tonemap != "linear":
+            if not _OCIO_AVAILABLE:
+                raise Exception("Requested advanced colorspace but OpenColorIO is not installed. Install 'opencolorio'.")
+            try:
+                linear[...,:3] = _ocio_convert_rgb(linear[...,:3], "scene-linear Rec.709-sRGB", tonemap)
+            except Exception as e:
+                raise Exception(f"OCIO conversion failed when saving EXR to '{tonemap}' from 'scene-linear Rec.709-sRGB': {e}")
         
         bgr = linear.copy()
         bgr[:,:,:,0] = linear[:,:,:,2] # flip RGB to BGR for opencv

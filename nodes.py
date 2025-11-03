@@ -3,6 +3,10 @@ import re
 from glob import glob
 from tqdm import tqdm, trange
 import json
+import io
+import shutil
+import zipfile
+import urllib.request
 
 os.environ["OPENCV_IO_ENABLE_OPENEXR"] = "1"
 
@@ -33,38 +37,54 @@ def linearToSRGB(npArray):
     npArray[less] = npArray[less] * 12.92
     npArray[~less] = np.power(npArray[~less], 1/2.4) * 1.055 - 0.055
 
-def _get_ocio_config():
+def _resolve_ocio_config_path():
+    """Determine the OCIO config path using (env var, text file, local, fallback)."""
     if not _OCIO_AVAILABLE:
         raise Exception("OpenColorIO (opencolorio) is not installed. Install it via requirements.txt. No fallback will be applied.")
-    # Prefer a local config placed next to this file
+    env_cfg = os.environ.get("OCIO")
+    if env_cfg and os.path.exists(env_cfg):
+        return env_cfg
+    # 2) Check for explicit path file next to this module
     here = os.path.dirname(__file__)
+    path_file = os.path.join(here, "ocio_config_path.txt")
+    if os.path.exists(path_file):
+        try:
+            with open(path_file, "r") as f:
+                candidate = f.read().strip().strip('"')
+            if candidate and os.path.exists(candidate):
+                return candidate
+        except Exception:
+            pass
+    # 3) Prefer a local config placed next to this file
     local_cfg = os.path.join(here, "ocio-v2_demo.ocio")
     if os.path.exists(local_cfg):
-        return OCIO.Config.CreateFromFile(local_cfg)
-    # Fallback to common path provided by the user earlier
+        return local_cfg
+    # 4) Fallback to common path provided by the user earlier
     alt_cfg = r"E:\AI\OpenColorIO\docs\configurations\ocio-v2_demo.ocio"
     if os.path.exists(alt_cfg):
-        return OCIO.Config.CreateFromFile(alt_cfg)
+        return alt_cfg
     raise Exception("OCIO config 'ocio-v2_demo.ocio' not found. Place it alongside nodes.py or set a valid path.")
 
-_OCIO_TONEMAP_EXTRA = [
-    "ACEScg",
-    "ACES2065-1",
-    "ACEScc",
-    "ACEScct",
-    "ARRI LogC",
-    "RED Log3G10 / REDWideGamutRGB",
-    "Sony SLog3 / SGamut3",
-    "Log film scan (ADX10)",
-    "scene-linear Rec.709-sRGB",
-    "Raw",
-]
+def _get_ocio_config():
+    path = _resolve_ocio_config_path()
+    return OCIO.Config.CreateFromFile(path)
+
+def _list_ocio_colorspaces():
+    if not _OCIO_AVAILABLE:
+        return []
+    try:
+        cfg = _get_ocio_config()
+        # Return all colorspace names defined by the active config
+        return [cs.getName() for cs in cfg.getColorSpaces()]
+    except Exception:
+        return []
 
 def _get_tonemap_options():
     base = ["linear", "sRGB", "Reinhard"]
     if _OCIO_AVAILABLE:
-        # Only add extras if OCIO is available
-        return base + _OCIO_TONEMAP_EXTRA
+        # Dynamically include all available OCIO color spaces from the active config
+        spaces = sorted(set(_list_ocio_colorspaces()))
+        return base + spaces
     return base
 
 def _ocio_convert_rgb(rgb_np, from_space, to_space):
@@ -845,6 +865,97 @@ class SaveImageAndPromptIncremental:
         return { "ui": { "images": list() } }
 
 
+class OCIOInfo:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {"required": {}}
+
+    CATEGORY = "HQ-Image-Save"
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("info",)
+    FUNCTION = "info"
+
+    def info(self):
+        if not _OCIO_AVAILABLE:
+            return ("OpenColorIO not available. Install PyOpenColorIO to enable advanced colorspaces.",)
+        try:
+            cfg_path = _resolve_ocio_config_path()
+            cfg = _get_ocio_config()
+            spaces = [cs.getName() for cs in cfg.getColorSpaces()]
+            spaces_preview = ", ".join(spaces[:25]) + (" …" if len(spaces) > 25 else "")
+            summary = f"OCIO config: {cfg_path}\nColorspaces ({len(spaces)}): {spaces_preview}"
+            return (summary,)
+        except Exception as e:
+            return (f"OCIO error: {e}",)
+
+class DownloadACESConfig:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "version": (["aces-1.3"], {"default": "aces-1.3"}),
+            }
+        }
+
+    CATEGORY = "HQ-Image-Save"
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("result",)
+    FUNCTION = "download"
+    OUTPUT_NODE = True
+
+    def _target_dirs(self):
+        here = os.path.dirname(__file__)
+        configs_dir = os.path.join(here, "configs")
+        aces_dir = os.path.join(configs_dir, "aces-1.3")
+        return configs_dir, aces_dir
+
+    def _write_ocio_path_file(self, config_path):
+        here = os.path.dirname(__file__)
+        path_file = os.path.join(here, "ocio_config_path.txt")
+        with open(path_file, "w") as f:
+            f.write(config_path)
+
+    def download(self, version):
+        # Source ZIP of the official ACES config repository (main branch)
+        # Contains aces_1.3/config.ocio and LUTs
+        zip_url = "https://github.com/AcademySoftwareFoundation/OpenColorIO-Config-ACES/archive/refs/heads/main.zip"
+        try:
+            configs_dir, aces_dir = self._target_dirs()
+            os.makedirs(configs_dir, exist_ok=True)
+            # Download zip in-memory to avoid partial files
+            with urllib.request.urlopen(zip_url) as response:
+                data = response.read()
+            with zipfile.ZipFile(io.BytesIO(data)) as zf:
+                # Extract only the aces_1.3 folder
+                temp_extract = os.path.join(configs_dir, "_tmp_extract")
+                if os.path.exists(temp_extract):
+                    shutil.rmtree(temp_extract)
+                zf.extractall(temp_extract)
+                # Locate aces_1.3/config.ocio within extracted repo
+                # Typical path: OpenColorIO-Config-ACES-main/aces_1.3/config.ocio
+                found_config = None
+                for root, dirs, files in os.walk(temp_extract):
+                    if "config.ocio" in files and os.path.basename(root) == "aces_1.3":
+                        found_config = os.path.join(root, "config.ocio")
+                        # Copy the entire aces_1.3 folder into target aces_dir
+                        if os.path.exists(aces_dir):
+                            shutil.rmtree(aces_dir)
+                        shutil.copytree(root, aces_dir)
+                        break
+                shutil.rmtree(temp_extract, ignore_errors=True)
+                if not found_config:
+                    return ("ACES 1.3 config not found in downloaded archive.",)
+            config_path = os.path.join(aces_dir, "config.ocio")
+            if not os.path.exists(config_path):
+                return (f"Expected config not present at {config_path}",)
+            # Point the node to use the new config automatically
+            self._write_ocio_path_file(config_path)
+            return (f"Downloaded ACES 1.3 config to {aces_dir}\nConfigured OCIO to {config_path}",)
+        except Exception as e:
+            return (f"Download failed: {e}",)
+
 NODE_CLASS_MAPPINGS = {
     "LoadEXR": LoadEXR,
     "LoadEXRFrames": LoadEXRFrames,
@@ -856,6 +967,8 @@ NODE_CLASS_MAPPINGS = {
     "LoadImageAndPrompt": LoadImageAndPrompt,
     "SaveImageAndPromptExact": SaveImageAndPromptExact,
     "SaveImageAndPromptIncremental": SaveImageAndPromptIncremental,
+    "OCIOInfo": OCIOInfo,
+    "DownloadACESConfig": DownloadACESConfig,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -869,4 +982,6 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "LoadImageAndPrompt": "Load Image And Prompt",
     "SaveImageAndPromptExact": "Save Image And Prompt (exact)",
     "SaveImageAndPromptIncremental": "Save Image And Prompt (incremental)",
+    "OCIOInfo": "OCIO Info",
+    "DownloadACESConfig": "Download ACES Config",
 }

@@ -20,11 +20,12 @@
 ## Overview
 Save and load images and latents as 32bit EXRs, with professional color management and HDR video support.
 
-### HDR Video Pipeline
-Load HDR video files and convert them to scene-linear EXR for professional delivery:
-1. **Load Video (HDR)** — Decodes video at 16-bit precision using ffmpeg. Supports any source colorspace available in your OCIO config (e.g. Rec.2100-PQ for Topaz Video AI HDR output).
-2. **ComfyUI processing** — Apply any processing in ComfyUI's sRGB-encoded IMAGE format. HDR values above 1.0 are preserved through the sRGB round-trip.
-3. **Save EXR** — Set the target colorspace (e.g. ACEScg) to save proper scene-linear EXR files.
+### HDR Video Pipeline (Topaz Video AI → ACEScg EXR)
+Convert HDR video files to scene-linear EXR for professional delivery. This solves a common problem with **Topaz Video AI's SDR-to-HDR (Hyperion)** workflow: Topaz outputs BT.2100-PQ encoded video (Rec.2020 primaries, ST-2084/PQ transfer), but saving directly to EXR or TIFF produces flat/washed-out images because EXR assumes scene-linear data while PQ is perceptually encoded. The solution is to export from Topaz as **Apple ProRes MOV** (which preserves PQ correctly in the container) and use this pipeline to convert:
+
+1. **Load Video (HDR)** — Decodes ProRes MOV (or any video: MP4, MKV, etc.) at 16-bit precision using ffmpeg. Set `source_colorspace` to `Rec.2100-PQ` for Topaz HDR output. The node applies OCIO to convert PQ to scene-linear, preserving the full HDR range.
+2. **ComfyUI processing** — Apply any processing in ComfyUI's sRGB-encoded IMAGE format. HDR values above 1.0 are preserved through the sRGB round-trip so no data is lost.
+3. **Save EXR** — Set the target colorspace (e.g. `ACEScg`, `ACES2065-1`, or any OCIO space) to save proper scene-linear EXR files ready for Nuke, Resolve, or any ACES-aware application.
 
 Frame controls (start_frame, end_frame, skip_first_frames, select_every_nth, image_load_cap) let you process specific frame ranges or subsample long videos.
 

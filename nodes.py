@@ -1,5 +1,6 @@
 import os
 import re
+import subprocess
 from glob import glob
 from tqdm import tqdm, trange
 import json
@@ -14,13 +15,7 @@ import cv2 as cv
 import torch
 import numpy as np
 
-# Optional OpenColorIO (OCIO) import for advanced colorspaces
-try:
-    import PyOpenColorIO as OCIO  # type: ignore
-    _OCIO_AVAILABLE = True
-except Exception:
-    OCIO = None
-    _OCIO_AVAILABLE = False
+import PyOpenColorIO as OCIO  # type: ignore
 
 import folder_paths
 from comfy.cli_args import args
@@ -39,8 +34,6 @@ def linearToSRGB(npArray):
 
 def _resolve_ocio_config_path():
     """Determine the OCIO config path using (env var, text file, local, fallback)."""
-    if not _OCIO_AVAILABLE:
-        raise Exception("OpenColorIO (opencolorio) is not installed. Install it via requirements.txt. No fallback will be applied.")
     env_cfg = os.environ.get("OCIO")
     if env_cfg and os.path.exists(env_cfg):
         return env_cfg
@@ -70,8 +63,6 @@ def _get_ocio_config():
     return OCIO.Config.CreateFromFile(path)
 
 def _list_ocio_colorspaces():
-    if not _OCIO_AVAILABLE:
-        return []
     try:
         cfg = _get_ocio_config()
         # Return all colorspace names defined by the active config
@@ -81,11 +72,182 @@ def _list_ocio_colorspaces():
 
 def _get_tonemap_options():
     base = ["linear", "sRGB", "Reinhard"]
-    if _OCIO_AVAILABLE:
-        # Dynamically include all available OCIO color spaces from the active config
-        spaces = sorted(set(_list_ocio_colorspaces()))
-        return base + spaces
-    return base
+    # Dynamically include all available OCIO color spaces from the active config
+    spaces = sorted(set(_list_ocio_colorspaces()))
+    return base + spaces
+
+def _find_ffmpeg():
+    """Locate ffmpeg executable via env var, PATH, common locations, or imageio-ffmpeg."""
+    env_path = os.environ.get("FFMPEG_PATH")
+    if env_path and os.path.isfile(env_path):
+        return env_path
+    found = shutil.which("ffmpeg")
+    if found:
+        return found
+    for p in [r"C:\ffmpeg-6.0-full_build\bin\ffmpeg.exe", r"C:\ffmpeg\bin\ffmpeg.exe"]:
+        if os.path.isfile(p):
+            return p
+    try:
+        from imageio_ffmpeg import get_ffmpeg_exe
+        return get_ffmpeg_exe()
+    except Exception:
+        pass
+    return None
+
+def _find_ffprobe():
+    """Locate ffprobe next to ffmpeg or on PATH."""
+    ffmpeg = _FFMPEG_PATH
+    if ffmpeg:
+        ext = ".exe" if os.name == "nt" else ""
+        ffprobe = os.path.join(os.path.dirname(ffmpeg), "ffprobe" + ext)
+        if os.path.isfile(ffprobe):
+            return ffprobe
+    found = shutil.which("ffprobe")
+    if found:
+        return found
+    return None
+
+_FFMPEG_PATH = _find_ffmpeg()
+_FFPROBE_PATH = _find_ffprobe()
+
+def _probe_video(filepath):
+    """Use ffprobe to get video stream metadata."""
+    if not _FFPROBE_PATH:
+        raise Exception(
+            "ffprobe not found. Install ffmpeg and add it to PATH, "
+            "or set the FFMPEG_PATH environment variable."
+        )
+    cmd = [
+        _FFPROBE_PATH, "-v", "quiet",
+        "-print_format", "json",
+        "-show_format", "-show_streams",
+        "-select_streams", "v:0",
+        filepath,
+    ]
+    result = subprocess.run(cmd, capture_output=True, check=True, timeout=30)
+    info = json.loads(result.stdout.decode("utf-8"))
+    if not info.get("streams"):
+        raise Exception(f"No video stream found in: {filepath}")
+    stream = info["streams"][0]
+
+    r_frame_rate = stream.get("r_frame_rate", "24/1")
+    num, den = map(int, r_frame_rate.split("/"))
+    fps = num / den if den else 24.0
+
+    nb_frames = int(stream.get("nb_frames", 0))
+    if nb_frames == 0:
+        duration = float(info.get("format", {}).get("duration", 0))
+        nb_frames = int(duration * fps) if duration else 0
+
+    pix_fmt = stream.get("pix_fmt", "unknown")
+    profile = stream.get("profile", "")
+    has_alpha = ("4444" in profile) or ("rgba" in pix_fmt) or ("yuva" in pix_fmt)
+
+    return {
+        "width": int(stream["width"]),
+        "height": int(stream["height"]),
+        "nb_frames": nb_frames,
+        "fps": fps,
+        "pix_fmt": pix_fmt,
+        "has_alpha": has_alpha,
+        "codec_name": stream.get("codec_name", ""),
+        "profile": profile,
+    }
+
+def _decode_video_frames(filepath, probe_info, start_frame=0, end_frame=-1,
+                         select_every_nth=1, image_load_cap=0):
+    """Decode video frames at 16-bit precision using ffmpeg subprocess.
+
+    Returns (rgb, alpha):
+        rgb:   np.ndarray (N, H, W, 3) float32 [0, 1]
+        alpha: np.ndarray (N, H, W)    float32 [0, 1], or None
+    """
+    if not _FFMPEG_PATH:
+        raise Exception(
+            "ffmpeg not found. Install ffmpeg and add it to PATH, "
+            "or set the FFMPEG_PATH environment variable."
+        )
+    width = probe_info["width"]
+    height = probe_info["height"]
+    has_alpha = probe_info["has_alpha"]
+    nb_frames = probe_info["nb_frames"]
+    fps = probe_info["fps"]
+
+    if end_frame < 0 or end_frame >= nb_frames:
+        end_frame = nb_frames - 1
+    if start_frame < 0:
+        start_frame = 0
+    if start_frame > end_frame:
+        raise Exception(f"start_frame ({start_frame}) > end_frame ({end_frame})")
+
+    total_source_frames = end_frame - start_frame + 1
+
+    wanted_indices = list(range(0, total_source_frames, select_every_nth))
+    if image_load_cap > 0:
+        wanted_indices = wanted_indices[:image_load_cap]
+    if not wanted_indices:
+        raise Exception("No frames to load with the given parameters")
+
+    if has_alpha:
+        pix_fmt = "rgba64le"
+        channels = 4
+    else:
+        pix_fmt = "rgb48le"
+        channels = 3
+
+    bytes_per_frame = width * height * channels * 2  # uint16
+
+    cmd = [_FFMPEG_PATH, "-hide_banner", "-loglevel", "error"]
+    if start_frame > 0:
+        cmd += ["-ss", f"{start_frame / fps:.6f}"]
+    cmd += ["-i", filepath]
+    cmd += ["-frames:v", str(total_source_frames)]
+    cmd += ["-f", "rawvideo", "-pix_fmt", pix_fmt, "pipe:1"]
+
+    proc = subprocess.Popen(
+        cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        bufsize=bytes_per_frame * 4,
+    )
+
+    rgb_list = []
+    alpha_list = [] if has_alpha else None
+    wanted_set = set(wanted_indices)
+    frames_collected = 0
+    target_count = len(wanted_indices)
+
+    if PROGRESS_BAR_ENABLED:
+        pbar = ProgressBar(target_count)
+    else:
+        pbar = None
+
+    try:
+        for source_idx in tqdm(range(total_source_frames), desc="decoding video"):
+            raw = proc.stdout.read(bytes_per_frame)
+            if len(raw) < bytes_per_frame:
+                break
+            if source_idx in wanted_set:
+                frame = np.frombuffer(raw, dtype=np.uint16).reshape(height, width, channels)
+                frame_f32 = frame.astype(np.float32) / 65535.0
+                rgb_list.append(frame_f32[:, :, :3])
+                if has_alpha:
+                    alpha_list.append(frame_f32[:, :, 3])
+                frames_collected += 1
+                if pbar is not None:
+                    pbar.update(1)
+                if frames_collected >= target_count:
+                    break
+    finally:
+        proc.stdout.close()
+        proc.stderr.close()
+        proc.wait()
+
+    if frames_collected == 0:
+        raise Exception("No frames were decoded from the video")
+
+    rgb_array = np.stack(rgb_list, axis=0)
+    alpha_array = np.stack(alpha_list, axis=0) if has_alpha else None
+    return rgb_array, alpha_array
+
 
 def _ocio_convert_rgb(rgb_np, from_space, to_space):
     """
@@ -145,8 +307,6 @@ def load_EXR(filepath, tonemap):
     else:
         # Advanced OCIO path: assume EXR data is encoded in 'tonemap' space and convert to
         # scene-linear Rec.709-sRGB primaries, then convert to sRGB display for Comfy UI IMAGE input.
-        if not _OCIO_AVAILABLE:
-            raise Exception("Requested advanced colorspace but OpenColorIO is not installed. Install 'opencolorio'.")
         # Convert from source -> scene-linear Rec.709-sRGB
         try:
             rgb = _ocio_convert_rgb(rgb, tonemap, "scene-linear Rec.709-sRGB")
@@ -344,19 +504,17 @@ class SaveEXR:
             linear[...,:3] = np.clip(linear[...,:3], 0, 1)
         elif tonemap != "linear":
             # Advanced OCIO: convert from scene-linear Rec.709-sRGB to requested space
-            if not _OCIO_AVAILABLE:
-                raise Exception("Requested advanced colorspace but OpenColorIO is not installed. Install 'opencolorio'.")
             try:
                 linear[...,:3] = _ocio_convert_rgb(linear[...,:3], "scene-linear Rec.709-sRGB", tonemap)
             except Exception as e:
                 raise Exception(f"OCIO conversion failed when saving EXR to '{tonemap}' from 'scene-linear Rec.709-sRGB': {e}")
-        
+
         bgr = linear.copy()
         bgr[:,:,:,0] = linear[:,:,:,2] # flip RGB to BGR for opencv
         bgr[:,:,:,2] = linear[:,:,:,0]
         if bgr.shape[-1] > 3:
             bgr[:,:,:,3] = np.clip(1 - linear[:,:,:,3], 0, 1) # invert alpha
-        
+
         if version < 0:
             ver = ""
         else:
@@ -455,8 +613,6 @@ class SaveEXRFrames:
             linearToSRGB(linear[...,:3])
             linear[...,:3] = np.clip(linear[...,:3], 0, 1)
         elif tonemap != "linear":
-            if not _OCIO_AVAILABLE:
-                raise Exception("Requested advanced colorspace but OpenColorIO is not installed. Install 'opencolorio'.")
             try:
                 linear[...,:3] = _ocio_convert_rgb(linear[...,:3], "scene-linear Rec.709-sRGB", tonemap)
             except Exception as e:
@@ -877,8 +1033,6 @@ class OCIOInfo:
     FUNCTION = "info"
 
     def info(self):
-        if not _OCIO_AVAILABLE:
-            return ("OpenColorIO not available. Install PyOpenColorIO to enable advanced colorspaces.",)
         try:
             cfg_path = _resolve_ocio_config_path()
             cfg = _get_ocio_config()
@@ -956,6 +1110,96 @@ class DownloadACESConfig:
         except Exception as e:
             return (f"Download failed: {e}",)
 
+class LoadVideo:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "filepath": ("STRING", {"default": "path to video file (.mov, .mp4, .mkv)"}),
+                "source_colorspace": (_get_tonemap_options(), {"default": "sRGB"}),
+            },
+            "optional": {
+                "start_frame": ("INT", {"default": 0, "min": 0, "step": 1}),
+                "end_frame": ("INT", {"default": -1, "min": -1, "step": 1}),
+                "image_load_cap": ("INT", {"default": 0, "min": 0, "step": 1}),
+                "skip_first_frames": ("INT", {"default": 0, "min": 0, "step": 1}),
+                "select_every_nth": ("INT", {"default": 1, "min": 1, "step": 1}),
+            },
+        }
+
+    CATEGORY = "HQ-Image-Save"
+
+    RETURN_TYPES = ("IMAGE", "MASK", "INT", "FLOAT")
+    RETURN_NAMES = ("RGB", "alpha", "batch_size", "fps")
+    FUNCTION = "load"
+
+    def load(self, filepath, source_colorspace,
+             start_frame=0, end_frame=-1, image_load_cap=0,
+             skip_first_frames=0, select_every_nth=1):
+        p = os.path.normpath(filepath.replace('"', '').strip())
+        if not os.path.exists(p):
+            raise Exception("Video file not found: " + p)
+        if not os.path.isfile(p):
+            raise Exception("Path is not a file: " + p)
+
+        probe = _probe_video(p)
+        print(f"[LoadVideo] {probe['codec_name']} {probe['profile']} "
+              f"{probe['width']}x{probe['height']} @ {probe['fps']:.3f} fps, "
+              f"{probe['nb_frames']} frames, pix_fmt={probe['pix_fmt']}, "
+              f"alpha={probe['has_alpha']}")
+
+        effective_start = start_frame + skip_first_frames
+
+        rgb_array, alpha_array = _decode_video_frames(
+            p, probe,
+            start_frame=effective_start,
+            end_frame=end_frame,
+            select_every_nth=select_every_nth,
+            image_load_cap=image_load_cap,
+        )
+
+        batch_size = rgb_array.shape[0]
+
+        # Apply colorspace conversion (same logic as load_EXR)
+        if source_colorspace == "sRGB":
+            # Decoded values are sRGB display-referred, pass through
+            rgb_array = np.clip(rgb_array, 0, 1)
+        elif source_colorspace == "Reinhard":
+            rgb_array = np.clip(rgb_array, 0, None)
+            rgb_array = rgb_array / (rgb_array + 1)
+            linearToSRGB(rgb_array)
+            rgb_array = np.clip(rgb_array, 0, 1)
+        elif source_colorspace == "linear":
+            pass
+        else:
+            # OCIO path: convert from source colorspace to scene-linear Rec.709-sRGB,
+            # then apply sRGB transfer for ComfyUI display encoding.
+            # No clipping — HDR values above 1.0 are preserved so that SaveEXR's
+            # sRGBtoLinear() can recover the full scene-linear range losslessly.
+            try:
+                rgb_array = _ocio_convert_rgb(
+                    rgb_array, source_colorspace, "scene-linear Rec.709-sRGB"
+                )
+            except Exception as e:
+                raise Exception(
+                    f"OCIO conversion failed from '{source_colorspace}' "
+                    f"to 'scene-linear Rec.709-sRGB': {e}"
+                )
+            linearToSRGB(rgb_array)
+
+        rgb_tensor = torch.from_numpy(rgb_array)
+
+        if alpha_array is not None:
+            mask_tensor = torch.from_numpy(np.clip(alpha_array, 0, 1))
+        else:
+            mask_tensor = torch.zeros(
+                (batch_size, rgb_array.shape[1], rgb_array.shape[2]),
+                dtype=torch.float32,
+            )
+
+        return (rgb_tensor, mask_tensor, batch_size, probe["fps"])
+
+
 NODE_CLASS_MAPPINGS = {
     "LoadEXR": LoadEXR,
     "LoadEXRFrames": LoadEXRFrames,
@@ -969,6 +1213,7 @@ NODE_CLASS_MAPPINGS = {
     "SaveImageAndPromptIncremental": SaveImageAndPromptIncremental,
     "OCIOInfo": OCIOInfo,
     "DownloadACESConfig": DownloadACESConfig,
+    "HQS_LoadVideo": LoadVideo,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -984,4 +1229,5 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SaveImageAndPromptIncremental": "Save Image And Prompt (incremental)",
     "OCIOInfo": "OCIO Info",
     "DownloadACESConfig": "Download ACES Config",
+    "HQS_LoadVideo": "Load Video (HDR)",
 }

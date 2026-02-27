@@ -1,4 +1,4 @@
-# ComfyUI-HQ-Image-Save
+# ComfyUI-HQ-Image-Save-Plus
 ## Nodes:
 - Image
   - Load EXR (Individual file, or batch from folder, with cap/skip/nth controls in the same pattern as VHS load nodes)
@@ -6,26 +6,48 @@
   - Save EXR (RGB or RGBA 32bpc EXR, with full support for batches and either relative paths in the output folder, or absolute paths with version and frame number formatting, and overwrite protection)
   - Save EXR Frames (frame sequence with %04d formatting, optionally save workflow as GUI .json and/or API .json)
   - Save Tiff (RGB 16bpc TIFF, outdated)
+- Video
+  - Load Video (HDR) — Load video files (MOV, MP4, MKV, etc.) at 16-bit precision via ffmpeg with full OCIO colorspace conversion support. Ideal for HDR workflows such as Topaz Video AI SDR-to-HDR (Rec.2100-PQ) → ACEScg EXR delivery.
 - Latent
   - Load Latent EXR (Same VHS style controls now)
   - Save Latent EXR (4 channel latent -> RGBA 32bpc EXR)
+- Utility
+  - OCIO Info — Display the active OCIO config path and all available colorspaces
+  - Download ACES Config — One-click download of the official ACES OCIO config
+  - Save Image And Prompt / Save Image And Prompt (incremental) — Save images with workflow metadata
+  - Load Image And Prompt — Load images with their saved workflow metadata
 
 ## Overview
-Save and load images and latents as 32bit EXRs
+Save and load images and latents as 32bit EXRs, with professional color management and HDR video support.
 
-### New (OCIO) Color Space Support
+### HDR Video Pipeline
+Load HDR video files and convert them to scene-linear EXR for professional delivery:
+1. **Load Video (HDR)** — Decodes video at 16-bit precision using ffmpeg. Supports any source colorspace available in your OCIO config (e.g. Rec.2100-PQ for Topaz Video AI HDR output).
+2. **ComfyUI processing** — Apply any processing in ComfyUI's sRGB-encoded IMAGE format. HDR values above 1.0 are preserved through the sRGB round-trip.
+3. **Save EXR** — Set the target colorspace (e.g. ACEScg) to save proper scene-linear EXR files.
+
+Frame controls (start_frame, end_frame, skip_first_frames, select_every_nth, image_load_cap) let you process specific frame ranges or subsample long videos.
+
+### OCIO Color Space Support
 - Load and save EXR with professional color spaces via OpenColorIO (OCIO)
-- Added tonemap options alongside existing ones (linear, sRGB, Reinhard):
+- Tonemap/colorspace options alongside built-in ones (linear, sRGB, Reinhard):
   - ACES: ACEScg, ACES2065-1, ACEScc, ACEScct
+  - HDR: Rec.2100-PQ, Rec.2100-HLG
   - Camera Log: ARRI LogC, RED Log3G10 / REDWideGamutRGB, Sony SLog3 / SGamut3, Log film scan (ADX10)
   - Utility: scene-linear Rec.709-sRGB, Raw
 - Batch-safe processing for save/load with OCIO (handles (B,H,W,3) and (H,W,3))
-- No silent fallbacks: missing OCIO or unknown color space will raise a clear error
+- No silent fallbacks: missing dependencies or unknown color spaces raise clear errors at startup
 
 ### Requirements
-- Python package: `opencolorio` (added to requirements.txt)
+- Python packages (install via `pip install -r requirements.txt`):
+  - `opencv-python`
+  - `imageio`
+  - `opencolorio` (PyOpenColorIO)
+- ffmpeg (required for Load Video node): must be on PATH or set `FFMPEG_PATH` environment variable
 - OCIO config file: `ocio-v2_demo.ocio`
-  - Placed automatically in this node folder (or you can point to your own)
+  - Placed automatically in this node folder (or you can point to your own via `OCIO` env var)
+
+All Python dependencies are validated at startup — if any are missing, the node pack will fail to load with a clear error message listing the missing packages and the pip install command.
 
 ### CLI Recommendations
 - Launch ComfyUI with higher precision for EXR workflows:
@@ -48,4 +70,5 @@ b = (0.208 * r + 0.173 * g + 0.264 * b - 0.473 * a) * 0.18215
 ## Known Issues
 
 - No load TIFF node, and the TIFF save is bad/outdated
-- If you select an OCIO color space that is not present in your config, the node will raise an explicit error listing the failing step.
+- If you select an OCIO color space that is not present in your config, the node will raise an explicit error listing the failing step
+- OpenCV's EXR codec may be disabled by default — set `OPENCV_IO_ENABLE_OPENEXR=1` environment variable or see [this issue](https://github.com/spacepxl/ComfyUI-HQ-Image-Save/issues/8)
